@@ -31,8 +31,9 @@ static int nfds;
 K_SEM_DEFINE(netif_ready, 0, 1);
 
 #define MQTT_POLL_MSEC	500
-#define MQTT_ESP32_DEMO_TOPIC "/esp32/hello"
-#define MQTT_ESP32_DEMO_CLID "3.81.179.172"
+#define MQTT_ESP32_BROKER_IP "192.168.1.4"
+#define MQTT_ESP32_DEMO_PUB_TOPIC "esp32/pub"
+#define MQTT_ESP32_DEMO_SUB_TOPIC "esp32/sub"
 #define MQTT_ESP32_DEMO_USER "ongkdrvv"
 #define MQTT_ESP32_DEMO_PWD "HBYF91mehJcP"
 
@@ -63,6 +64,10 @@ static int poll_socks(int timeout)
 void app_mqtt_evt_handler(struct mqtt_client *const client,
 		      const struct mqtt_evt *evt)
 {
+	struct mqtt_puback_param puback;
+	uint8_t data[128];
+	int len;
+	int bytes_read;
 	int err;
 
 	switch (evt->type) {
@@ -73,6 +78,32 @@ void app_mqtt_evt_handler(struct mqtt_client *const client,
 		}
 		LOG_INF("MQTT client connected!");
 
+		break;
+
+	case MQTT_EVT_PUBLISH:
+		len = evt->param.publish.message.payload.len;
+
+		LOG_INF("MQTT publish received %d, %d bytes", evt->result, len);
+		LOG_INF(" id: %d, qos: %d", evt->param.publish.message_id,
+			evt->param.publish.message.topic.qos);
+
+		while (len) {
+			bytes_read = mqtt_read_publish_payload(&client_ctx,
+					data,
+					len >= sizeof(data) - 1 ?
+					sizeof(data) - 1 : len);
+			if (bytes_read < 0 && bytes_read != -EAGAIN) {
+				LOG_ERR("failure to read payload");
+				break;
+			}
+
+			data[bytes_read] = '\0';
+			LOG_INF("   payload: %s", log_strdup(data));
+			len -= bytes_read;
+		}
+
+		puback.message_id = evt->param.publish.message_id;
+		mqtt_publish_qos1_ack(&client_ctx, &puback);
 		break;
 
 	case MQTT_EVT_DISCONNECT:
@@ -117,12 +148,38 @@ void app_mqtt_evt_handler(struct mqtt_client *const client,
 
 		break;
 
+	case MQTT_EVT_SUBACK:
+		LOG_INF("SUBACK packet id: %u", evt->param.suback.message_id);
+		break;
+
+	case MQTT_EVT_UNSUBACK:
+		LOG_INF("UNSUBACK packet id: %u", evt->param.suback.message_id);
+		break;
+
 	case MQTT_EVT_PINGRESP:
 		LOG_INF("PINGRESP packet");
 		break;
 
 	default:
+		LOG_INF("Unhandled MQTT event %d", evt->type);
 		break;
+	}
+}
+
+static void app_mqtt_subscribe(struct mqtt_client *client) {
+	int rc;
+	struct mqtt_topic topic = {};
+	struct mqtt_subscription_list subs_list = {};
+
+	topic.topic.utf8 = (uint8_t *)MQTT_ESP32_DEMO_SUB_TOPIC;
+	topic.topic.size = strlen(topic.topic.utf8);
+	subs_list.list = &topic;
+	subs_list.list_count = 1;
+	subs_list.message_id = 1;
+
+	rc = mqtt_subscribe(client, &subs_list);
+	if (rc) {
+		LOG_ERR("Subscribe failed for topic %s", MQTT_ESP32_DEMO_SUB_TOPIC);
 	}
 }
 
@@ -131,7 +188,7 @@ static int app_mqtt_publish(struct mqtt_client *client, enum mqtt_qos qos)
 	struct mqtt_publish_param param;
 
 	param.message.topic.qos = qos;
-	param.message.topic.topic.utf8 = (uint8_t *)MQTT_ESP32_DEMO_TOPIC;
+	param.message.topic.topic.utf8 = (uint8_t *)MQTT_ESP32_DEMO_PUB_TOPIC;
 	param.message.topic.topic.size =
 			strlen(param.message.topic.topic.utf8);
 	param.message.payload.data = CONFIG_BOARD;
@@ -141,7 +198,7 @@ static int app_mqtt_publish(struct mqtt_client *client, enum mqtt_qos qos)
 	param.dup_flag = 0U;
 	param.retain_flag = 0U;
 
-	LOG_INF("Publish topic: %s", MQTT_ESP32_DEMO_TOPIC);
+	LOG_INF("Publish topic: %s", MQTT_ESP32_DEMO_PUB_TOPIC);
 	LOG_INF("Publish data: %s", CONFIG_BOARD);
 
 	return mqtt_publish(client, &param);
@@ -152,9 +209,9 @@ static void app_mqtt_broker_init(void)
 	struct sockaddr_in *broker4 = (struct sockaddr_in *)&broker;
 
 	broker4->sin_family = AF_INET;
-	broker4->sin_port = htons(16328);
+	broker4->sin_port = htons(1883);
 
-	zsock_inet_pton(AF_INET, MQTT_ESP32_DEMO_CLID, &broker4->sin_addr);
+	zsock_inet_pton(AF_INET, MQTT_ESP32_BROKER_IP, &broker4->sin_addr);
 }
 
 static void app_mqtt_client_init(struct mqtt_client *client)
@@ -264,19 +321,18 @@ static void wifi_interface_init(void)
 
 void main(void)
 {
-	uint32_t count = 10;
-
 	wifi_interface_init();
 	app_mqtt_client_init(&client_ctx);
 
 	app_mqtt_connect(&client_ctx);
 
+	app_mqtt_subscribe(&client_ctx);
+
 	while(1) {		
 		app_mqtt_process_mqtt(&client_ctx);
-		if(count-- == 0) {
-			count = 0;
-			app_mqtt_publish(&client_ctx, MQTT_QOS_0_AT_MOST_ONCE);
-		}
 
+		app_mqtt_publish(&client_ctx, MQTT_QOS_0_AT_MOST_ONCE);
+
+		k_msleep(1000);
 	}
 }
